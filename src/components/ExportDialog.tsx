@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Download, Loader2, Film, Image, Layers } from 'lucide-react';
+import { Download, Loader2, Film, Image, Layers, AlertCircle, Copy, Check, Type, FileText } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
@@ -15,6 +15,7 @@ import {
   mergeVisibleLayersToCanvas,
   renderAnimationCompositeCanvas,
 } from '@/utils/helpers';
+import { performOCR, copyTextToClipboard, downloadTextFile } from '@/utils/ocr';
 
 interface ExportDialogProps {
   open: boolean;
@@ -26,6 +27,20 @@ interface ExportDialogProps {
   layers?: Layer[];
   backgroundSettings?: BackgroundSettings;
 }
+
+const LANGUAGE_OPTIONS = [
+  { code: 'eng', label: 'English' },
+  { code: 'fra', label: 'French' },
+  { code: 'deu', label: 'German' },
+  { code: 'spa', label: 'Spanish' },
+  { code: 'ita', label: 'Italian' },
+  { code: 'por', label: 'Portuguese' },
+  { code: 'rus', label: 'Russian' },
+  { code: 'jpn', label: 'Japanese' },
+  { code: 'zho_sim', label: 'Chinese (Simplified)' },
+  { code: 'zho_tra', label: 'Chinese (Traditional)' },
+  { code: 'ara', label: 'Arabic' },
+];
 
 function decodeImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -65,7 +80,7 @@ export function ExportDialog({
   layers = [],
   backgroundSettings,
 }: ExportDialogProps) {
-  const [mode, setMode] = useState<'image' | 'sequence' | 'video'>('image');
+  const [mode, setMode] = useState<'image' | 'sequence' | 'video' | 'text'>('image');
   const [isExporting, setIsExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState('');
   const [exportProgress, setExportProgress] = useState(0);
@@ -78,6 +93,13 @@ export function ExportDialog({
   const [videoFpsDraft, setVideoFpsDraft] = useState('24');
   const [videoBitrateMbps, setVideoBitrateMbps] = useState(4);
   const [videoBitrateDraft, setVideoBitrateDraft] = useState('4');
+  const [extractedText, setExtractedText] = useState('');
+  const [language, setLanguage] = useState('eng');
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState('');
+  const [copied, setCopied] = useState(false);
+  const copiedTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
 
   const cancelRef = useRef(false);
 
@@ -89,6 +111,10 @@ export function ExportDialog({
       setExportProgress(0);
       setVideoFpsDraft(String(videoFps));
       setVideoBitrateDraft(String(videoBitrateMbps));
+      setExtractedText('');
+      setProgress(0);
+      setError('');
+      setCopied(false);
       cancelRef.current = false;
     }
   }, [open, canvasSize.width, canvasSize.height, videoBitrateMbps, videoFps]);
@@ -358,6 +384,7 @@ export function ExportDialog({
   const handleExport = () => {
     if (mode === 'image') exportImage();
     else if (mode === 'sequence') void exportSequence();
+    else if (mode === 'text') void exportText();
     else void exportVideo();
   };
 
@@ -383,6 +410,70 @@ export function ExportDialog({
     setVideoBitrate(bitratePresetFromMbps(rounded));
   };
 
+  const handleExtractText = useCallback(async () => {
+    if (layers.length === 0) {
+      setError('No layers to extract text from.');
+      return;
+    }
+
+    setIsExporting(true);
+    setError('');
+    setExtractedText('');
+    setProgress(0);
+
+    try {
+      /* Merge all visible layers into a single canvas */
+      const canvas = mergeVisibleLayersToCanvas(
+        canvasSize.width,
+        canvasSize.height,
+        layers,
+        backgroundSettings
+      );
+
+      /* Perform OCR */
+      const result = await performOCR(canvas, language, (prog) => {
+        setProgress(prog);
+      });
+
+      setExtractedText(result.text);
+      setProgress(100);
+
+      /* Log confidence for debugging */
+      if (result.confidence) {
+        console.log(`OCR Confidence: ${(result.confidence * 100).toFixed(1)}%`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      console.error('Text extraction error:', err);
+    } finally {
+      setIsExporting(false);
+    }
+  }, [layers, canvasSize, backgroundSettings, language]);
+
+  const exportText = useCallback(() => {
+    if (!extractedText) return;
+    try {
+      downloadTextFile(extractedText, `takingnotes_text_${Date.now()}.txt`);
+    } catch (err) {
+      setError(`Failed to download: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [extractedText]);
+
+  const handleCopy = useCallback(async () => {
+    if (!extractedText) return;
+    try {
+      await copyTextToClipboard(extractedText);
+      setCopied(true);
+      if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
+      copiedTimeoutRef.current = window.setTimeout(() => {
+        setCopied(false);
+      }, 2000);
+    } catch (err) {
+      setError(`Failed to copy: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [extractedText]);
+
   return (
     <Dialog open={open} onOpenChange={isExporting ? undefined : onOpenChange}>
       <DialogContent className="max-w-md bg-neutral-900 border-neutral-700 text-neutral-100">
@@ -392,7 +483,7 @@ export function ExportDialog({
             Export
           </DialogTitle>
           <DialogDescription className="text-neutral-400">
-            Save your drawing as an image, frame sequence, or rendered video.
+            Save your drawing as an image, frame sequence, rendered video, or extracted text.
           </DialogDescription>
         </DialogHeader>
 
@@ -401,7 +492,7 @@ export function ExportDialog({
             <Label>Export As</Label>
             <Select
               value={mode}
-              onValueChange={(value) => setMode(value as 'image' | 'sequence' | 'video')}
+              onValueChange={(value) => setMode(value as 'image' | 'sequence' | 'video' | 'text')}
               disabled={isExporting}
             >
               <SelectTrigger className="bg-neutral-800 border-neutral-700">
@@ -417,10 +508,14 @@ export function ExportDialog({
                 <SelectItem value="video">
                   <span className="flex items-center gap-2"><Film className="h-4 w-4" /> Video (.webm)</span>
                 </SelectItem>
+                <SelectItem value="text">
+                  <span className="flex items-center gap-2"><Type className="h-4 w-4" />  Text (using OCR)</span>
+                </SelectItem>
               </SelectContent>
             </Select>
           </div>
 
+          {mode !== 'text' ?
           <div className="space-y-2">
             <Label>Resolution</Label>
             <div className="flex items-center gap-2">
@@ -477,6 +572,85 @@ export function ExportDialog({
               ))}
             </div>
           </div>
+          :
+          <div className="space-y-4 max-h-[60vh] overflow-y-auto">
+            {/* Language Selection */}
+            <div className="space-y-2">
+              <Label>Language</Label>
+              <Select
+                value={language}
+                onValueChange={setLanguage}
+                disabled={isExporting || extractedText.length > 0}
+              >
+                <SelectTrigger className="bg-neutral-800 border-neutral-700">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-neutral-800 border-neutral-700">
+                  {LANGUAGE_OPTIONS.map((lang) => (
+                    <SelectItem key={lang.code} value={lang.code}>
+                      {lang.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Progress Indicator */}
+            {isExporting && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label className="text-sm">Processing</Label>
+                  <span className="text-xs text-neutral-400">{progress}%</span>
+                </div>
+              </div>
+            )}
+
+            {/* Error Message */}
+            {error && (
+              <div className="rounded-lg border border-red-900/50 bg-red-950/30 p-3 flex gap-2">
+                <AlertCircle className="h-4 w-4 text-red-400 flex-shrink-0 mt-0.5" />
+                <p className="text-sm text-red-200">{error}</p>
+              </div>
+            )}
+
+            {/* Extracted Text Display */}
+            {extractedText && (
+              <div className="space-y-2">
+                <Label>Extracted Text</Label>
+                <textarea
+                  value={extractedText}
+                  onChange={(e) => setExtractedText(e.target.value)}
+                  className="w-full h-64 rounded-lg border border-neutral-700 bg-neutral-800 p-3 text-sm text-neutral-100 placeholder-neutral-500 focus:border-blue-500 focus:outline-none resize-none"
+                  placeholder="Extracted text will appear here..."
+                />
+                <p className="text-xs text-neutral-500">
+                  Character count: {extractedText.length}
+                </p>
+              </div>
+            )}
+
+            {!extractedText && (
+              <Button
+                onClick={handleExtractText}
+                disabled={isExporting || layers.length === 0}
+                className="bg-blue-600 hover:bg-blue-700"
+              >
+                {isExporting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <FileText className="h-4 w-4 mr-2" />
+                    Extract Text
+                  </>
+                )}
+              </Button>
+            )}
+            
+          </div>
+          }
 
           {mode === 'image' && (
             <div className="space-y-2">
@@ -651,6 +825,19 @@ export function ExportDialog({
           <Button variant="ghost" onClick={handleCancel}>
             {isExporting ? 'Cancel' : 'Close'}
           </Button>
+
+          {extractedText && (
+            <Button
+              variant="outline"
+              onClick={handleCopy}
+              className="border-neutral-700 hover:bg-neutral-800"
+            >
+              {copied ? (<><Check className="h-4 w-4 mr-2" /> Copied!</>) 
+              : 
+              (<><Copy className="h-4 w-4 mr-2"/> Copy</>)}
+            </Button>
+          )}
+
           <Button
             onClick={handleExport}
             disabled={
